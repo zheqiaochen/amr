@@ -1,0 +1,989 @@
+---
+title: "Two Way Interference Simulation: The Temporal-Spatio Estimator"
+output: pdf_document
+---
+
+```{r effection, echo=FALSE}
+rm(list=ls())
+library(panelView)
+library(ggplot2)
+require(raster)
+require(fields)
+library(igraph)
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+Rcpp::sourceCpp("../package/SpatialEffect/src/Conley.cpp")
+
+kernUp <- function(r,a){exp(-(r/a)^2)}
+# effectFun <- function(d, sh, sc, a){(dgamma(abs(d), shape=sh, scale=2*sc) - a*dgamma(abs(d), shape=5*sh, scale=sc))}
+effectFun <- function(r, a){(r <= 3)*kernUp(0, a) + (r > 3)*kernUp(r, a)}
+len <- 7
+plotVec <- seq(from=0, to=len, by=.25)
+effect <- 1.6
+# plot(plotVec, effect*effectFun(plotVec, 1, .4, 1), type="l", 
+#      ylab="Effect curve", xlab="Distance (coordinate degrees)", cex = 2)
+plot(plotVec, effect*kernUp(plotVec, 3), type="l", 
+     ylab="Effect curve", xlab="Distance (coordinate degrees)", cex = 2)
+```
+
+$scale^2$: the number of units
+$unit_size$: the unit along each length   
+We define the effect for each history $(1, 1)$ relative to $(0, 1)$, and the effect for $(0, 1)$ relative to $(0, 0)$.
+```{r two-way generator, echo=FALSE}
+tw_generator <- function(N, effect = 3, Y_sd = 0.1, T0 = 1, T1 = 3, type = "non-monotonic", staggered = 0, FE = FALSE, lag = 0.6, het = TRUE, p = 2, beta = c(0.3, 0.5), nsims = 1000){
+
+  # network formation
+  kappa <- 8 / pi
+  r_N <- sqrt(kappa / N)
+  adj_mat <- matrix(0, N, N)
+  alpha1 <- runif(N, 0, 1)
+  alpha2 <- runif(N, 0, 1)
+  alpha <- cbind(alpha1, alpha2)
+  d_mat <- as.matrix(dist(alpha, method = "euclidean"))
+  
+  adj_mat[d_mat <= r_N] <- 1
+  diag(adj_mat) <- 0
+  
+  node_degrees <- rowSums(adj_mat)
+  
+  graph <- graph_from_adjacency_matrix(adj_mat, mode = "undirected")
+  
+  dist_mat <- distances(graph)
+  num_neighbors <- t(apply(dist_mat, 1, function(x) as.integer(table(x)[as.character(x)])))
+  # Here the value of each raster indicates the fixed value of outcome nodes
+  
+  fn <- apply(dist_mat == 1, 1, sum)
+  inverse_fn <- ifelse(fn != 0, 1/fn, 0) # 1 / no. of first-degree neighbors
+
+  # alpha is unit FE, xi is period FE, mu is global intercept
+  # two periods, 0 and 1
+  mu <- 0.3
+  
+  # generate the distance between any two points
+  TT <- T0 + T1
+  xi <- rnorm(TT, 0, 1)
+  
+  # two covariates (confounders), one is correlated with alpha the other is not
+  Y0t <- matrix(NA, N, TT)
+  for (t in 1:TT){
+    Y0t[, t] <- mu + xi[t] + rnorm(N, 0, Y_sd) 
+  }
+  curZ <- pscores <- Y0s <- Y1s <- ind_effects <- array(NA, c(nsims, N, TT))
+  # Y0 denotes the benchmark without any treatment
+  # Y1 is the observed outcome
+  for (c in 1:nsims){
+    curZ[c, , (1:T0)] <- pscores[c, , (1:T0)] <- 0
+    for (t in 1:T0){
+      Y1s[c, , t] <- Y0s[c, , t] <- Y0t[, t]
+      pscores[c, , t] <- curZ[c, , t] <- ind_effects[c, , t] <- rep(0, N)
+    }
+    for (t in (T0+1):TT){
+      pp <- .1 + .2*Y1s[c, , (t-1)] - .6*curZ[c, , (t-1)] + rnorm(N, 0, .5)
+      pscore <- pmax(exp(pp) / (exp(pp) + 1), 0)
+      pscore <- pmin(pscore, 1)
+      if (staggered == 1){
+        pscore <- pmax(pscore, curZ[c, , (t-1)])
+      }
+      pscores[c, , t] <- pscore
+      tempZ <- rbinom(N, 1, pscore)
+      while (sum(tempZ) == 0 | sum(tempZ) == N){
+        tempZ <- rbinom(N, 1, pscore)
+      }
+      curZ[c, , t] <- tempZ
+
+      if (het == 1){
+        effect_scale1 <- alpha1 / 2 + 1
+        effect_scale2 <- alpha2 / 2
+      }else{
+        effect_scale1 <- effect_scale2 <- rep(1, N)
+      }
+      if (type == "non-monotonic"){
+        for (ii in 1:N){
+          ind_effects[c, ii, t] <- effect_scale1[ii]*effect*sum(kernUp(dist_mat[ii, ], 3)*curZ[c, , t]/num_neighbors[ii, ]) + effect_scale2[ii]*effect*sum(kernUp(dist_mat[ii, ], 3)*curZ[c, , t]*curZ[c, ii, t]/num_neighbors[ii, ])
+        }
+      }else if (type == "monotonic"){
+        for (ii in 1:N){
+          ind_effects[c, ii, t] <- effect_scale1[ii]*effect*sum(kernUp(dist_mat[ii, ], 3)*curZ[c, , t]/num_neighbors[ii, ])
+        }
+      }
+      Y0s[c, , t] <- Y0t[, t]
+      Y1s[c, , t] <- Y0s[c, , t] + ind_effects[c, , t] + lag*ind_effects[c, , (t-1)] + 0.4 * Y1s[c, , (t-1)] + 0.1 * (dist_mat == 1) %*% Y1s[c, , (t-1)] * inverse_fn
+      # Y1s[c, , t] <- Y0s[c, , t] + 2*curZ[c, , t] + 0.8 * Y1s[c, , (t-1)]
+    }
+  }
+  
+  # taus[t, i, ] is the marginalized effect caused by unit i in period t for all the units
+  
+  mu_11 <- mu_01 <- mu_10 <- mu_00 <- matrix(NA, N, N)# each element ij is i's marginalized effect on j
+  for(i in 1:N){
+      mu_11[i, ] <- apply(Y1s[apply(curZ[, i, 2:3], 1, function(x) identical(x, c(1, 1))), , 3], 2, mean)
+      mu_01[i, ] <- apply(Y1s[apply(curZ[, i, 2:3], 1, function(x) identical(x, c(0, 1))), , 3], 2, mean)
+      mu_10[i, ] <- apply(Y1s[apply(curZ[, i, 2:3], 1, function(x) identical(x, c(1, 0))), , 3], 2, mean)
+      mu_00[i, ] <- apply(Y1s[apply(curZ[, i, 2:3], 1, function(x) identical(x, c(0, 0))), , 3], 2, mean)
+  }
+
+  mus <- list(mu_11, mu_01, mu_10, mu_00)
+
+  result_list <- list(Y0s, Y1s, graph, pscores, curZ, ind_effects, mus, dist_mat)
+  return(result_list)
+}
+```
+
+Now we simulate the data and examine the estimator's performance 
+```{r data generating, echo=FALSE}
+set.seed(2025)
+N <- 400
+effect <- 1
+Y_sd <- 1
+T0 <- 1
+T1 <- 2
+TT <- T0 + T1
+staggered <- 0
+FE <- 0
+lag <- .5
+het <- 1
+p <- 0
+beta <- c(0.1, 0.2)
+nsims <- 1000
+type <- "non-monotonic"
+sim_data <- tw_generator(N = N, effect = effect, Y_sd = Y_sd, T0 = T0, T1 = T1, staggered = staggered, type = type, FE = FE, lag = lag, het = het, p = p, beta = beta, nsims = nsims)
+save(sim_data, file = "../data/Simulations/Network/sim_data_nonmono_msm.RData")
+
+load("../data/Simulations/Network/sim_data_nonmono_msm.RData")
+Y0.data <- sim_data[[1]]
+Y1.data <- sim_data[[2]]
+graph <- sim_data[[3]]
+pscores_true <- sim_data[[4]]
+curZ <- sim_data[[5]]
+ind_effects <- sim_data[[6]]
+mus <- sim_data[[7]]
+mu_11 <- mus[[1]]
+mu_01 <- mus[[2]]
+mu_10 <- mus[[3]]
+mu_00 <- mus[[4]]
+dist_mat <- sim_data[[8]]
+
+table(apply(curZ[1, , ], 1, function(x) identical(x, c(0, 0, 0))))
+table(apply(curZ[1, , ], 1, function(x) identical(x, c(0, 1, 0))))
+table(apply(curZ[1, , ], 1, function(x) identical(x, c(0, 0, 1))))
+table(apply(curZ[1, , ], 1, function(x) identical(x, c(0, 1, 1))))
+
+mean(pscores_true[, , 2])
+mean(pscores_true[, , 3])
+
+first_degree_neighbors <- neighbors(graph, v = 42)
+second_degree_neighbors <- list()
+for (i in seq_along(first_degree_neighbors)) {
+  second_degree_neighbors[[i]] <- neighbors(graph, first_degree_neighbors[i])
+}
+second_degree_neighbors <- unique(unlist(second_degree_neighbors))
+second_degree_neighbors <- setdiff(second_degree_neighbors, first_degree_neighbors)
+
+o_colors <- terrain.colors(length(Y1.data[1, , 3]))
+o_colors[second_degree_neighbors] <- "red"
+o_colors[42] <- "red"
+
+layout <- layout_with_fr(graph)  # or your preferred layout
+
+pdf("../graphs/Network/network_graph_msm.pdf", height=10, width=10)
+plot(graph, layout = layout, vertex.size = 7, vertex.label.cex = 0.6, vertex.color = o_colors)
+dev.off()
+hist(degree(graph))
+
+one_data <- data.frame("Y" = c(Y1.data[1, , ]), "Z" = c(curZ[1, , ]), "unit" = rep(1:N, TT), "period" = rep(0:2, each = N))
+pview <- panelview(Y ~ Z, index = c("unit", "period"), data = one_data, id = c(1:10), ylab = "Unit", xlab = "Period", background = "white", cex.axis = 20, cex.lab = 15, display.all = TRUE)
+ggsave(filename = "../graphs/Network/sim_panelview_msm.pdf", pview, width = 7, height = 7)
+```
+
+
+```{r functions, echo=FALSE}
+Rims1 <- function(graph, mu, dUp, N, dist_mat){
+
+  dUpMean <- rep(NA, N)
+  for (i in 1:N){
+    grid_index <- which(dist_mat[i, ] == dUp)
+    grids <- mu[i, grid_index]
+    dUpMean[i] <- mean(grids)
+  }
+  return(mean(dUpMean[!is.nan(dUpMean)]))
+}
+
+Rims2 <- function(graph, Yobs, dUp, N, dist_mat){
+  Ybard <- rep(NA, N)
+  
+  for (i in 1:N){
+    grid_index <- which(dist_mat[i, ] == dUp)
+    grids <- Yobs[grid_index]
+    Ybard[i] <- mean(grids)
+  }
+  return(Ybard)
+}
+
+ResponseSurface <- function(r_data, Y, A, l_A = NULL, X, dVec, Dist = NULL, Yxy = NULL, ras = NULL, numpts = NULL, gridRes = res(ras)[1], evalpts = 10, only.unique = 0){
+  
+  p <- ncol(r_data[, X])
+  ny <- length(r_data[, Y])
+  
+  e <- rep(1, ny)
+  # Y_pred <- matrix(NA, ny, num_periods)
+  D1 <- DA <- D_l_A <- matrix(NA, ny, length(dVec))
+  Dist_list <- list()
+  
+  # Y_pred <- matrix(NA, ny, num_periods)
+  
+  for (d in 1:length(dVec)){
+    dUp <- dVec[d]
+    if (d == 1){
+      Dist_d <- (Dist <= dUp)
+    }else{
+      Dist_d <- (Dist <= dUp & Dist > (dVec[d - 1]))
+    }
+    Dist_list[[d]] <- Dist_d
+    D1[, d] <- t(t(e) %*% Dist_d)
+    DA[, d] <- t(t(r_data[, A]) %*% Dist_d)
+    if (!is.null(l_A)){
+      D_l_A[, d] <- t(t(r_data[, l_A]) %*% Dist_d)
+    }
+  }
+  if (is.null(l_A)){
+    X_reg <- as.matrix(cbind(D1, DA, r_data[, X]))
+  }else{
+    X_reg <- as.matrix(cbind(D1, DA, D_l_A, r_data[, X]))
+  }
+  coef_reg <- (solve(t(X_reg) %*% X_reg) %*% t(X_reg) %*% r_data[, Y])
+  Ypred <- X_reg %*% coef_reg
+  result.list <- list(coef_reg, Dist_list, Ypred)
+  return(result.list)
+}
+```
+
+```{r MIR, echo=FALSE}
+dVec <- seq(from=0, to=7, by=1)
+AMRmat <- data.frame(d=dVec, tauda2=NA)
+AMRmat_11 <- AMRmat_01 <- AMRmat_10 <- AMRmat_00 <- rep(NA, length(dVec))
+AMEmat_11 <- AMEmat_01 <- AMEmat_10 <- rep(NA, length(dVec))
+
+for(dIndex in 1:length(dVec)){
+  dUp <- dVec[dIndex]
+  AMRmat_11[dIndex] <- Rims1(graph, mu_11, dUp, N, dist_mat)
+  AMRmat_01[dIndex] <- Rims1(graph, mu_01, dUp, N, dist_mat)
+  AMRmat_10[dIndex] <- Rims1(graph, mu_10, dUp, N, dist_mat)
+  AMRmat_00[dIndex] <- Rims1(graph, mu_00, dUp, N, dist_mat)
+  AMEmat_11[dIndex] <- Rims1(graph, mu_11 - mu_00, dUp, N, dist_mat)
+  AMEmat_01[dIndex] <- Rims1(graph, mu_01 - mu_00, dUp, N, dist_mat)
+  AMEmat_10[dIndex] <- Rims1(graph, mu_10 - mu_00, dUp, N, dist_mat)
+}
+```
+
+
+```{r plot MIR, echo=FALSE}
+pdf("../graphs/Network/Effect_nonmono_SI_msm.pdf", height = 7, width = 7)
+par(mfrow=c(1, 1))
+par(pty="s")
+plot(dVec, effect*kernUp(dVec, 2), type="b",
+     ylab="Effect Curve", xlab="Degree Distance (d)",
+     pc = 19,
+     cex.lab=1.5,
+     cex.main=1.5,
+     lty = "solid",
+     col = "black",
+     ylim = c(-.1, 4))
+legend("topright", legend = "Effect curve", lty = "solid", col = "black", bty = "n", cex = 1.2)
+dev.off()
+#effectFun(x, 1, 0.4, 1)
+
+pdf("../graphs/Network/AMRs_nonmono_SI_msm.pdf", height=7, width=7)
+par(mfrow=c(1, 1))
+par(pty="s")
+par(mar=c(5,4,4,2))
+plot((AMRmat_11 - AMRmat_00) ~ dVec,
+		 ylab=expression("MSM Parameters"~beta*"(d)"),
+		 xlab="Degree Distance (d)",
+		 type="b",
+		 pch=15,
+		 ylim=c(-.1, 4),
+     cex.lab=1.5,
+     cex.main=1.5)
+lines((AMRmat_01 - AMRmat_00) ~ dVec,
+		 type="b", pc = 17)
+lines((AMRmat_10 - AMRmat_00) ~ dVec,
+		 type="b", pc = 19)
+legend("topright", pch = c(15, 17, 19), 
+       legend = c(expression(mu*"((1,1);d)-"* mu*"((0,0);d):"~beta[1]*"(d)+"*beta[2]*"(d)+"*beta[3]*"(d)"),
+                  expression(mu*"((0,1);d)-"* mu*"((0,0);d):"~beta[2]*"(d)"),
+                  expression(mu*"((1,0);d)-"* mu*"((0,0);d):"~beta[1]*"(d)")), 
+       cex = 1.2, bty = "n")
+dev.off()
+```
+
+```{r IPTW with unknown propensity}
+msm_ests <- array(NA, c(nsims, length(dVec), 4))
+
+# estimate pscores
+pscores <- pscores_sw <- adj_terms <- array(NA, c(nsims, N, 2))
+for (zIndex in 1:nsims){
+  Zup <- curZ[zIndex,,((T0+1):TT)]
+  Y1obs <- Y1.data[zIndex, , 3]
+  Y0obs <- Y1.data[zIndex, , 1]
+  Y0_pre <- Y0obs
+  
+  p_data1 <- data.frame("Zup" = Zup[, 1], "l_Y" = Y1.data[zIndex,, 1], "l_Z" = curZ[zIndex,,1])
+  p_data2 <- data.frame("Zup" = Zup[, 2], "l_Y" = Y1.data[zIndex,, 2], "l_Z" = curZ[zIndex,,2])
+  pscore_fit1 <- glm(Zup ~ l_Y + l_Z, p_data1, family = "binomial")
+  pscore_pred1 <- suppressWarnings(predict(pscore_fit1, newdata = p_data1[, c("l_Y", "l_Z")], type = "response"))
+  pscore_fit2 <- glm(Zup ~ l_Y + l_Z, p_data2, family = "binomial")
+  pscore_pred2 <- suppressWarnings(predict(pscore_fit2, newdata = p_data2[, c("l_Y", "l_Z")], type = "response"))  
+
+  pscore_sw_pred1 <- suppressWarnings(predict(glm(Zup ~ l_Z, p_data1, family = "binomial"), newdata = data.frame("l_Z" = p_data1[, "l_Z"]), type = "response"))
+  pscore_sw_pred2 <- suppressWarnings(predict(glm(Zup ~ l_Z, p_data2, family = "binomial"), newdata = data.frame("l_Z" = p_data2[, "l_Z"]), type = "response"))
+  
+  pscore <- cbind(pscore_pred1, pscore_pred2)
+  pscore_sw <- cbind(pscore_sw_pred1, pscore_sw_pred2)
+
+  adj_term <- matrix(NA, N, 2)
+  pscore_predictors1 <- model.matrix(pscore_fit1)
+  pscore_predictors2 <- model.matrix(pscore_fit2)
+  
+  pscore_diag1 <- diag(pscore[, 1] * (1 - pscore[, 1]))
+  pscore_var1 <- t(pscore_predictors1) %*% pscore_diag1 %*% (pscore_predictors1)
+  pscore_diag2 <- diag(pscore[, 2] * (1 - pscore[, 2]))
+  pscore_var2 <- t(pscore_predictors2) %*% pscore_diag2 %*% (pscore_predictors2)
+  adj_term[, 1] <- (p_data2$Zup * pscore_sw[, 2] / pscore[, 2] + (1 - p_data2$Zup) * (1 -  pscore_sw[, 2]) / (1 - pscore[, 2])) * ((1 - pscore[, 1]) * p_data1$Zup * pscore_sw[, 1] / pscore[, 1] - pscore[, 1] * (1 - p_data1$Zup) * (1 - pscore_sw[, 1]) / (1 - pscore[, 1]))
+  adj_term[, 2] <- (p_data1$Zup * pscore_sw[, 1] / pscore[, 1] + (1 - p_data1$Zup) * (1 -  pscore_sw[, 1]) / (1 - pscore[, 1])) * ((1 - pscore[, 2]) * p_data2$Zup * pscore_sw[, 2] / pscore[, 2] - pscore[, 2] * (1 - p_data2$Zup) * (1 - pscore_sw[, 2]) / (1 - pscore[, 2]))
+
+  pscores[zIndex, , ] <- pscore
+  pscores_sw[zIndex, , ] <- pscore_sw
+  adj_terms[zIndex, , ] <- adj_term
+  
+  if (zIndex %% 100 == 0){
+    cat(zIndex)
+  }
+}
+
+# pscores <- pscores_true[,,2:3]
+
+for(zIndex in 1:nsims){
+  Zup <- curZ[zIndex, , ]
+  
+  Y1obs <- Y1.data[zIndex, , 3]
+  pscore <- pscores[zIndex, , ]
+  pscore_sw <- pscores_sw[zIndex, , ]
+  pscore[Zup[, 2:3] == 0] <- 1 - pscore[Zup[, 2:3] == 0]
+  pscore_sw[Zup[, 2:3] == 0] <- 1 - pscore_sw[Zup[, 2:3] == 0]
+
+  w_pscore <- apply(pscore_sw, 1, prod) / apply(pscore, 1, prod)
+  
+  for(dIndex in 1:length(dVec)){
+    Ybards <- Rims2(graph, Y1obs, dVec[dIndex], N, dist_mat)
+    one_dat <- data.frame("mu" = Ybards, "Z1" = Zup[, 2], "Z2" = Zup[, 3], "w" = w_pscore)
+    msm_fit <- lm(mu ~ Z1 * Z2, weights = w, data = one_dat)
+    one_dat <- one_dat[!is.nan(one_dat$mu), ]
+    msm_ests[zIndex, dIndex, ] <- coef(msm_fit)
+  }
+  if (zIndex %% 100 == 0){
+    cat(zIndex)
+  }
+}
+
+amr_est_00 <- msm_ests[, , 1]
+amr_est_01 <- amr_est_00 + msm_ests[, , 3]
+amr_est_10 <- amr_est_00 + msm_ests[, , 2]
+amr_est_11 <- amr_est_00 + msm_ests[, , 2] + msm_ests[, , 3] + msm_ests[, , 4]
+
+IPTW_mono_SI_msm_unknownp <- list(amr_est_00, amr_est_01, amr_est_10, amr_est_11)
+save(IPTW_mono_SI_msm_unknownp,
+     file="../data/Simulations/Network/IPTW_nonmono_SI_msm_unknownp.RData")
+```
+
+
+```{r plot IPTW with unknown propensity}
+load("../data/Simulations/Network/IPTW_nonmono_SI_msm_unknownp.RData")
+amr_est_00 <- IPTW_mono_SI_msm_unknownp[[1]]
+amr_est_01 <- IPTW_mono_SI_msm_unknownp[[2]]
+amr_est_10 <- IPTW_mono_SI_msm_unknownp[[3]]
+amr_est_11 <- IPTW_mono_SI_msm_unknownp[[4]]
+
+ame_est_01 <- amr_est_01 - amr_est_00
+ame_est_10 <- amr_est_10 - amr_est_00
+ame_est_11 <- amr_est_11 - amr_est_00
+
+AMEmean_01 <- apply(ame_est_01, 2, mean)
+AMEmean_10 <- apply(ame_est_10, 2, mean)
+AMEmean_11 <- apply(ame_est_11, 2, mean)
+
+pdf("../graphs/Network/IPTW_nonmono_SI_msm_unknownp.pdf", height=4, width=12)
+par(mfrow=c(1, 3))
+par(mar=c(5, 5, 5, 2))
+par(pty="s")
+
+plot(AMEmat_10 ~ dVec,
+		 ylab=expression(hat(beta)[1]*"(d)"),
+		 xlab="Degree Distance (d)",
+		 type="n",
+		 ylim=c(-1, 5),
+		 main="Estimates of MSM Parameters",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for(zIndex in 1:nsims){
+  points(ame_est_10[zIndex, ] ~ dVec, col="gray", pch = 19)
+}
+points(AMEmat_10 ~ dVec, pch = 19, type = "b", cex = 2)
+points(AMEmean_10 ~ dVec, col="gray", pch = 1, type = "b", cex = 2)
+
+plot(AMEmat_01 ~ dVec,
+		 ylab=expression(hat(beta)[2]*"(d)"),
+		 xlab="Degree Distance (d)",
+		 type="n",
+		 ylim=c(-1, 5),
+		 main="Estimates of MSM Parameters",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for(zIndex in 1:nsims){
+  points(ame_est_01[zIndex, ] ~ dVec, col="gray", pch = 19)
+}
+points(AMEmat_01 ~ dVec, pch = 19, type = "b", cex = 2)
+points(AMEmean_01 ~ dVec, col="gray", pch = 1, type = "b", cex = 2)
+
+plot(AMEmat_11 ~ dVec, 
+     ylab=expression(hat(beta)[1]*"(d)+"*hat(beta)[2]*"(d)+"*hat(beta)[3]*"(d)"),
+		 xlab="Degree Distance (d)",
+		 type="n",
+		 ylim=c(-1, 5),
+		 main="Estimates of MSM Parameters",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for(zIndex in 1:nsims){
+  points(ame_est_11[zIndex, ] ~ dVec, col="gray", pch = 19)
+}
+points(AMEmat_11 ~ dVec, pch = 19, type = "b", cex = 2)
+points(AMEmean_11 ~ dVec, col="gray", pch = 1, type = "b", cex = 2)
+dev.off()
+
+par(pty="s")
+plot((AMRmat_10 - AMRmat_00) ~ dVec,
+		 ylab=expression(hat(beta)[1]*"(d)"),
+		 xlab="Degree Distance (d)",
+		 type="n",
+		 ylim=c(-1, 5),
+		 main="Estimates",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+points(AMEmean_10 ~ dVec, col="gray", pch = 19)
+# lines((AMRmat_10 - AMRmat_00) ~ dVec, pch = 19, type = "b")
+points((AMRmat_10 - AMRmat_00) ~ dVec, pch = 1, type = "b", cex = 1.5)
+
+plot((AMRmat_01 - AMRmat_00) ~ dVec,
+		 ylab=expression(hat(beta)[2]*"(d)"),
+		 xlab="Degree Distance (d)",
+		 type="n",
+		 ylim=c(-1, 5),
+		 main="Estimates",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+points(AMEmean_01 ~ dVec, col="gray", pch = 19)
+# lines((AMRmat_01 - AMRmat_00) ~ dVec, pch = 19, type = "b")
+points((AMRmat_01 - AMRmat_00) ~ dVec, pch = 1, type = "b", cex = 1.5)
+
+plot((AMRmat_11 - AMRmat_00) ~ dVec,
+		 ylab=expression(hat(beta)[3]*"(d)"),
+		 xlab="Degree Distance (d)",
+		 type="n",
+		 ylim=c(-1, 5),
+		 main="Estimates",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+points(AMEmean_11 ~ dVec, col="gray", pch = 19)
+# lines((AMRmat_11 - AMRmat_00) ~ dVec, pch = 19, type = "b")
+points((AMRmat_11 - AMRmat_00) ~ dVec, pch = 1, type = "b", cex = 1.5)
+
+```
+
+
+```{r consistency-data}
+sample_sizes <- c(15, 20, 25, 30, 35, 40)
+# the dimensions are sample sizes * distances * no. of estimands
+counter <- 1
+sim_data_list <- list()
+for (sample_size in sample_sizes){
+  N <- sample_size^2
+  effect <- 1
+  Y_sd <- 1
+  T0 <- 1
+  T1 <- 2
+  TT <- T0 + T1
+  staggered <- 0
+  FE <- 0
+  lag <- .6
+  het <- 1
+  p <- 0
+  beta <- c(0.1, 0.2)
+  nsims <- 1000
+  type <- "non-monotonic"
+  sim_data <- tw_generator(N = N, effect = effect, Y_sd = Y_sd, T0 = T0, T1 = T1, staggered = staggered, type = type, FE = FE, lag = lag, het = het, p = p, beta = beta, nsims = nsims)
+  sim_data_list[[counter]] <- sim_data
+  cat(counter, "\n")
+  counter <- counter + 1
+}
+
+save(sim_data_list, file = "../data/Simulations/Network/sim_data_nonmono_SI_list.RData")
+```
+
+```{r consistency est, warning=FALSE}
+Rcpp::sourceCpp("/Users/yewang/Dropbox/CurrentProjects/TwoWayInterference/package/SpatialEffect/src/ConleyRes.cpp")
+
+load("../data/Simulations/Network/sim_data_nonmono_SI_list.RData")
+sample_sizes <- c(15, 20, 25, 30, 35, 40)
+len <- 7
+dVec <- seq(from=0, to=len, by=1)
+T0 <- 1
+T1 <- 2
+TT <- 3
+p <- 0
+nsims <- 1000
+Allbias <- MSEs <- SupNorms <- coverage <- array(NA, c(length(sample_sizes), length(dVec), 3))
+realSEs <- meanSEs <- array(NA, c(length(sample_sizes), length(dVec), 3))
+cohortSize <- matrix(NA, length(sample_sizes), 4)
+
+for (cc in 1:length(sample_sizes)){
+  N <- sample_sizes[cc]^2
+  sim_data <- sim_data_list[[cc]]
+  Y0.data <- sim_data[[1]]
+  Y1.data <- sim_data[[2]]
+  graph <- sim_data[[3]]
+  pscores_true <- sim_data[[4]]
+  curZ <- sim_data[[5]]
+  ind_effects <- sim_data[[6]]
+  mus <- sim_data[[7]]
+  mu_11 <- mus[[1]]
+  mu_01 <- mus[[2]]
+  mu_10 <- mus[[3]]
+  mu_00 <- mus[[4]]
+  dist_mat <- sim_data[[8]]
+  
+  L_g <- average.path.length(graph)
+  delta_g <- mean(degree(graph))
+  cutoff_star <- ifelse(L_g < 2*log(N)/log(delta_g), 0.5*L_g, (L_g)^(1/3))
+  
+  AMRmat_11 <- AMRmat_01 <- AMRmat_10 <- AMRmat_00 <- rep(NA, length(dVec))
+  
+  for(dIndex in 1:length(dVec)){
+    dUp <- dVec[dIndex]
+    AMRmat_11[dIndex] <- Rims1(graph, mu_11, dUp, N, dist_mat)
+    AMRmat_01[dIndex] <- Rims1(graph, mu_01, dUp, N, dist_mat)
+    AMRmat_10[dIndex] <- Rims1(graph, mu_10, dUp, N, dist_mat)
+    AMRmat_00[dIndex] <- Rims1(graph, mu_00, dUp, N, dist_mat)
+  }
+  AMEmat_11 <- AMRmat_11 - AMRmat_00
+  AMEmat_01 <- AMRmat_01 - AMRmat_00
+  AMEmat_10 <- AMRmat_10 - AMRmat_00
+  
+  msm_ests <- array(NA, c(nsims, length(dVec), 3))
+  se_ests <- array(NA, c(nsims, length(dVec), 3))
+  sizes <- matrix(NA, nsims, 4)
+  bias <- MSE <- SupNorm <- covered <- array(NA, c(nsims, length(dVec), 3))
+  # estimate pscores
+  pscores <- pscores_sw <- adj_terms <- array(NA, c(nsims, N, 2))
+  pscore_predictors1_list <- pscore_predictors2_list <- list()
+  pscore_var1_list <- pscore_var2_list <- list()
+  for (zIndex in 1:nsims){
+    Zup <- curZ[zIndex,,((T0+1):TT)]
+    Y1obs <- Y1.data[zIndex, , 3]
+    Y0obs <- Y1.data[zIndex, , 1]
+    Y0_pre <- Y0obs
+    
+    p_data1 <- data.frame("Zup" = Zup[, 1], "l_Y" = Y1.data[zIndex,, 1], "l_Z" = curZ[zIndex,,1])
+    p_data2 <- data.frame("Zup" = Zup[, 2], "l_Y" = Y1.data[zIndex,, 2], "l_Z" = curZ[zIndex,,2])
+    pscore_fit1 <- glm(Zup ~ l_Y, p_data1, family = "binomial")
+    pscore_pred1 <- suppressWarnings(predict(pscore_fit1, newdata = as.data.frame(model.matrix(pscore_fit1)), type = "response"))
+    pscore_fit2 <- glm(Zup ~ l_Y + l_Z, p_data2, family = "binomial")
+    pscore_pred2 <- suppressWarnings(predict(pscore_fit2, newdata = as.data.frame(model.matrix(pscore_fit2)), type = "response"))  
+  
+    pscore_sw_pred1 <- suppressWarnings(predict(glm(Zup ~ l_Z, p_data1, family = "binomial"), newdata = data.frame("l_Z" = p_data1[, "l_Z"]), type = "response"))
+    pscore_sw_pred2 <- suppressWarnings(predict(glm(Zup ~ l_Z, p_data2, family = "binomial"), newdata = data.frame("l_Z" = p_data2[, "l_Z"]), type = "response"))
+    
+    pscore <- cbind(pscore_pred1, pscore_pred2)
+    pscore_sw <- cbind(pscore_sw_pred1, pscore_sw_pred2)
+  
+    adj_term <- matrix(NA, N, 2)
+    pscore_predictors1 <- model.matrix(pscore_fit1)
+    pscore_predictors2 <- model.matrix(pscore_fit2)
+    pscore_predictors1_list[[zIndex]] <- pscore_predictors1
+    pscore_predictors2_list[[zIndex]] <- pscore_predictors2
+
+    pscore_diag1 <- diag(pscore[, 1] * (1 - pscore[, 1]))
+    pscore_var1 <- t(pscore_predictors1) %*% pscore_diag1 %*% (pscore_predictors1)
+    pscore_diag2 <- diag(pscore[, 2] * (1 - pscore[, 2]))
+    pscore_var2 <- t(pscore_predictors2) %*% pscore_diag2 %*% (pscore_predictors2)
+    pscore_var1_list[[zIndex]] <- pscore_var1
+    pscore_var2_list[[zIndex]] <- pscore_var2
+    
+    adj_term[, 1] <- (p_data2$Zup * pscore_sw[, 2] / pscore[, 2] + (1 - p_data2$Zup) * (1 -  pscore_sw[, 2]) / (1 - pscore[, 2])) * ((1 - pscore[, 1]) * p_data1$Zup * pscore_sw[, 1] / pscore[, 1] - pscore[, 1] * (1 - p_data1$Zup) * (1 - pscore_sw[, 1]) / (1 - pscore[, 1]))
+    adj_term[, 2] <- (p_data1$Zup * pscore_sw[, 1] / pscore[, 1] + (1 - p_data1$Zup) * (1 -  pscore_sw[, 1]) / (1 - pscore[, 1])) * ((1 - pscore[, 2]) * p_data2$Zup * pscore_sw[, 2] / pscore[, 2] - pscore[, 2] * (1 - p_data2$Zup) * (1 - pscore_sw[, 2]) / (1 - pscore[, 2]))
+  
+    pscores[zIndex, , ] <- pscore
+    pscores_sw[zIndex, , ] <- pscore_sw
+    adj_terms[zIndex, , ] <- adj_term
+      
+    if (zIndex %% 100 == 0){
+      cat(zIndex)
+    }
+  }
+  
+  # pscores <- pscores_true[,,2:3]
+  dist_kernel_lists <- list()
+  for(zIndex in 1:nsims){
+    Zup <- curZ[zIndex, , ]
+    
+    sizes[zIndex, 1] <- sum(Zup[, 2] == 0 & Zup[, 3] == 0)
+    sizes[zIndex, 2] <- sum(Zup[, 2] == 1 & Zup[, 3] == 0)
+    sizes[zIndex, 3] <- sum(Zup[, 2] == 0 & Zup[, 3] == 1)
+    sizes[zIndex, 4] <- sum(Zup[, 2] == 1 & Zup[, 3] == 1)
+
+    Y1obs <- Y1.data[zIndex, , 3]
+    pscore_final <- pscores[zIndex, , ]
+    pscore_sw_final <- pscores_sw[zIndex, , ]
+    adj_term <- adj_terms[zIndex, , ]
+    pscore_predictors1 <- pscore_predictors1_list[[zIndex]]
+    pscore_predictors2 <- pscore_predictors2_list[[zIndex]]
+    pscore_var1 <- pscore_var1_list[[zIndex]]
+    pscore_var2 <- pscore_var2_list[[zIndex]]
+    
+    pscore_final[Zup[, 2:3] == 0] <- 1 - pscore_final[Zup[, 2:3] == 0]
+    pscore_sw_final[Zup[, 2:3] == 0] <- 1 - pscore_sw_final[Zup[, 2:3] == 0]
+  
+    w_pscore <- apply(pscore_sw_final, 1, prod) / apply(pscore_final, 1, prod)
+    
+    for(dIndex in 1:length(dVec)){
+      Ybards <- Rims2(graph, Y1obs, dVec[dIndex], N, dist_mat)
+      one_dat <- data.frame("mu" = Ybards, "Z1" = Zup[, 2], "Z2" = Zup[, 3], "w" = w_pscore)
+      nan.ind <- !is.nan(one_dat$mu)
+      msm_fit <- lm(mu ~ Z1 * Z2, weights = w, data = one_dat)
+      msm_ests[zIndex, dIndex, ] <- c(coef(msm_fit)[2:3], sum(coef(msm_fit)[2:4]))
+      W_mat <- diag(sqrt(one_dat$w))
+      W_mat <- W_mat[nan.ind, nan.ind]
+      res <- residuals(msm_fit)
+      Wres <- W_mat %*% res
+      X_mat <- cbind(rep(1, nrow(one_dat)), one_dat$Z1, one_dat$Z2, one_dat$Z1*one_dat$Z2)
+      X_mat <- X_mat[nan.ind, ]
+      WX_mat <- W_mat %*% X_mat
+      XX_mat_inv <- solve(t(X_mat) %*% X_mat)
+      W_meat <- WX_mat
+      dist_mat_c <- dist_mat[nan.ind, nan.ind]
+      cutoff <- max(2*dVec[dIndex], ceiling(cutoff_star))
+      
+      D_mat <- dist_mat == dVec[dIndex]
+      D_mat <- D_mat[nan.ind, ]
+  
+      row_sums <- rowSums(D_mat)
+      row_sums[row_sums == 0] <- 1
+      D_mat <- sweep(D_mat, 1, row_sums, FUN = "/")
+  
+      Z_mat <- t(WX_mat) %*% (W_mat %*% D_mat)
+      Y_hat_mat <- t(X_mat) %*% (W_mat^2 * diag(c(X_mat %*% coef(msm_fit))))
+      Y_res <- t(Z_mat %*% diag(Y1obs) - Y_hat_mat %*% D_mat)
+      
+      if (zIndex == 1){
+        Conley_result <- ConleySE(as.matrix(Y_res), as.matrix(Y_res), as.matrix(dist_mat), as.double(cutoff), as.integer(1), as.integer(1), NULL)
+        dist_kernel_lists[[dIndex]] <- Conley_result[["Dist_kernel"]]
+      } else{
+        Conley_result <- ConleySE(as.matrix(Y_res), as.matrix(Y_res), as.matrix(dist_mat), as.double(cutoff), as.integer(1), as.integer(1), as.matrix(dist_kernel_lists[[dIndex]]))
+      }
+      VCE <- t(XX_mat_inv) %*% Conley_result[["VCE_meat"]] %*% XX_mat_inv
+      
+      w1 <- t(pscore_predictors1[nan.ind, ]) %*% diag(res * adj_term[nan.ind, 1]) %*% X_mat / N
+      w2 <- t(pscore_predictors2[nan.ind, ]) %*% diag(res * adj_term[nan.ind, 2]) %*% X_mat / N
+      
+      VCE <- VCE - t(w1) %*% solve(pscore_var1) %*% w1 - t(w2) %*% solve(pscore_var2) %*% w2
+      
+      se_ests[zIndex, dIndex, 1] <- sqrt(t(c(0, 1, 0, 0)) %*% VCE %*% c(0, 1, 0, 0))
+      se_ests[zIndex, dIndex, 2] <- sqrt(t(c(0, 0, 1, 0)) %*% VCE %*% c(0, 0, 1, 0))
+      se_ests[zIndex, dIndex, 3] <- sqrt(t(c(0, 1, 1, 1)) %*% VCE %*% c(0, 1, 1, 1))
+    }
+    bias[zIndex, , 1] <- round(AMEmat_10 - msm_ests[zIndex, , 1], 5)
+    bias[zIndex, , 2] <- round(AMEmat_01 - msm_ests[zIndex, , 2], 5)
+    bias[zIndex, , 3] <- round(AMEmat_11 - msm_ests[zIndex, , 3], 5)
+
+    MSE[zIndex, ,1] <- round((AMEmat_10 - msm_ests[zIndex, , 1])^2, 5)
+    MSE[zIndex, ,2] <- round((AMEmat_01 - msm_ests[zIndex, , 2])^2, 5)
+    MSE[zIndex, ,3] <- round((AMEmat_11 - msm_ests[zIndex, , 3])^2, 5)
+    
+    SupNorm[zIndex, ,1] <- round(abs(AMEmat_10 - msm_ests[zIndex, , 1]), 5)
+    SupNorm[zIndex, ,2] <- round(abs(AMEmat_01 - msm_ests[zIndex, , 2]), 5)
+    SupNorm[zIndex, ,3] <- round(abs(AMEmat_11 - msm_ests[zIndex, , 3]), 5)
+    
+    covered[zIndex, , 1] <- (AMEmat_10 >= msm_ests[zIndex, , 1] - 1.96 * se_ests[zIndex, , 1] & AMEmat_10 <= msm_ests[zIndex, , 1] + 1.96 * se_ests[zIndex, , 1])
+    covered[zIndex, , 2] <- (AMEmat_01 >= msm_ests[zIndex, , 2] - 1.96 * se_ests[zIndex, , 2] & AMEmat_01 <= msm_ests[zIndex, , 2] + 1.96 * se_ests[zIndex, , 2])
+    covered[zIndex, , 3] <- (AMEmat_11 >= msm_ests[zIndex, , 3] - 1.96 * se_ests[zIndex, , 3] & AMEmat_11 <= msm_ests[zIndex, , 3] + 1.96 * se_ests[zIndex, , 3])
+    if (zIndex %% 100 == 0){
+      cat(zIndex)
+    }
+  }
+  
+  cohortSize[cc, 1] <- mean(sizes[, 1])
+  cohortSize[cc, 2] <- mean(sizes[, 2])
+  cohortSize[cc, 3] <- mean(sizes[, 3])
+  cohortSize[cc, 4] <- mean(sizes[, 4])
+  
+  realSEs[cc, , 1] <- apply(se_ests[, , 1], 2, sd)
+  realSEs[cc, , 2] <- apply(se_ests[, , 2], 2, sd)
+  realSEs[cc, , 3] <- apply(se_ests[, , 3], 2, sd)
+
+  meanSEs[cc, , 1] <- apply(se_ests[, , 1], 2, function(x) mean(x, na.rm = TRUE))
+  meanSEs[cc, , 2] <- apply(se_ests[, , 2], 2, function(x) mean(x, na.rm = TRUE))
+  meanSEs[cc, , 3] <- apply(se_ests[, , 3], 2, function(x) mean(x, na.rm = TRUE))
+  
+  Allbias[cc, , 1] <- apply(bias[, , 1], 2, mean)
+  Allbias[cc, , 2] <- apply(bias[, , 2], 2, mean)
+  Allbias[cc, , 3] <- apply(bias[, , 3], 2, mean)
+  
+  MSEs[cc, , 1] <- apply(MSE[, , 1], 2, mean)
+  MSEs[cc, , 2] <- apply(MSE[, , 2], 2, mean)
+  MSEs[cc, , 3] <- apply(MSE[, , 3], 2, mean)
+  
+  SupNorms[cc, , 1] <- apply(SupNorm[, , 1], 2, mean)
+  SupNorms[cc, , 2] <- apply(SupNorm[, , 2], 2, mean)
+  SupNorms[cc, , 3] <- apply(SupNorm[, , 3], 2, mean)
+  
+  coverage[cc, , 1] <- apply(covered[, , 1], 2, function(x) mean(x, na.rm = TRUE))
+  coverage[cc, , 2] <- apply(covered[, , 2], 2, function(x) mean(x, na.rm = TRUE))
+  coverage[cc, , 3] <- apply(covered[, , 3], 2, function(x) mean(x, na.rm = TRUE))
+  cat(cc, "\n")
+}
+
+save(Allbias, MSEs, SupNorms, coverage, cohortSize, file = "../data/Simulations/Network/msm_asym_nonmono_result.RData")
+```
+
+```{r plot consistency}
+load("../data/Simulations/Network/msm_asym_nonmono_result.RData")
+
+sample_sizes <- c(20, 25, 30, 35, 40)
+bias_colors <- colorRampPalette(c("blue", "red"))(length(sample_sizes))
+len <- 7
+dVec <- seq(from=0, to=len, by=1)
+
+pdf(file="../graphs/Network/msm_mse_asym_nonmono.pdf", height=4, width=12)
+par(mfrow=c(1, 3))
+par(mar=c(5, 5, 5, 2))
+par(pty="s")
+plot(0,
+     ylab=expression(hat(beta)[1]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(-.1, .5),
+     main="MSE",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(MSEs[i, , 1]~dVec, lwd = 2, col = bias_colors[i])
+}
+legend("topright", col = bias_colors, lty = 1, lwd = 2,
+       legend = paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 2], 0)), cex = 1.5, bty = "n")
+plot(0,
+     ylab=expression(hat(beta)[2]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(-.1, .5),
+     main="MSE",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(MSEs[i, , 2]~dVec, lwd = 2, col = bias_colors[i])
+}
+legend("topright", col = bias_colors, lty = 1, lwd = 2,
+       legend = paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 3], 0)), cex = 1.5, bty = "n")
+plot(0,
+     ylab=expression(hat(beta)[1]*"(d)+"*hat(beta)[2]*"(d)+"*hat(beta)[3]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(-.1, .5),
+     main="MSE",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(MSEs[i, , 3]~dVec, lwd = 2, col = bias_colors[i])
+}
+legend("topright", col = bias_colors, lty = 1, lwd = 2,
+       legend = paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 4], 0)), cex = 1.5, bty = "n")
+dev.off()
+
+pdf(file="../graphs/Network/msm_bias_asym_nonmono.pdf", height=4, width=12)
+par(mfrow=c(1, 3))
+par(mar=c(5, 5, 5, 2))
+par(pty="s")
+plot(0,
+     ylab=expression(hat(beta)[1]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(-.1, .5),
+     main="Average Bias",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(Allbias[i, , 1] ~ dVec, lwd = 2, col = bias_colors[i])
+}
+legend("topright", col = bias_colors, lty = 1, lwd = 2, 
+       legend = paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 2], 0)), cex = 1.5, bty = "n")
+plot(0,
+     ylab=expression(hat(beta)[2]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(-.1, .5),
+     main="Average Bias",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(Allbias[i, , 2] ~ dVec, lwd = 2, col = bias_colors[i])
+}
+legend("topright", col = bias_colors, lty = 1, lwd = 2, 
+       legend = paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 3], 0)), cex = 1.5, bty = "n")
+plot(0,
+     ylab=expression(hat(beta)[1]*"(d)+"*hat(beta)[2]*"(d)+"*hat(beta)[3]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(-.1, .5),
+     main="Average Bias",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(Allbias[i, , 3] ~ dVec, lwd = 2, col = bias_colors[i])
+}
+legend("topright", col = bias_colors, lty = 1, lwd = 2, 
+       legend = paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 4], 0)), cex = 1.5, bty = "n")
+dev.off()
+
+pdf(file="../graphs/Network/msm_supbias_asym_nonmono.pdf", height=4, width=12)
+par(mfrow=c(1, 3))
+par(mar=c(5, 5, 5, 2))
+par(pty="s")
+plot(0,
+     ylab=expression(hat(beta)[1]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(-.1, .5),
+     main="Supreme of Bias",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(SupNorms[i, , 1]~dVec, lwd = 2, col = bias_colors[i])
+}
+legend("topright", col = bias_colors, lty = 1, lwd = 2, 
+       legend = paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 2], 0)), cex = 1.5, bty = "n")
+plot(0,
+     ylab=expression(hat(beta)[2]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(-.1, .5),
+     main="Supreme of Bias",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(SupNorms[i, , 2]~dVec, lwd = 2, col = bias_colors[i])
+}
+legend("topright", col = bias_colors, lty = 1, lwd = 2, 
+       legend = paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 3], 0)), cex = 1.5, bty = "n")
+plot(0,
+     ylab=expression(hat(beta)[1]*"(d)+"*hat(beta)[2]*"(d)+"*hat(beta)[3]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(-.1, .5),
+     main="Supreme of Bias",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(SupNorms[i, , 3]~dVec, lwd = 2, col = bias_colors[i])
+}
+legend("topright", col = bias_colors, lty = 1, lwd = 2, 
+       legend = paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 4], 0)), cex = 1.5, bty = "n")
+dev.off()
+
+
+pdf(file="../graphs/Network/msm_coverage_nonmono.pdf", height=4, width=12)
+par(mfrow=c(1, 3))
+par(mar=c(5, 5, 5, 2))
+par(pty="s")
+plot(0,
+     ylab=expression(hat(beta)[1]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(0, 1),
+     main="Coverage Rate of the 95% CI",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(coverage[i, , 1] ~ dVec, lwd = 2, col = bias_colors[i])
+}
+abline(h = 0.95, lty = 2, lwd = 3)
+legend("bottomleft", col = c(bias_colors, "black"), lty=c(rep(1, length(bias_colors)), 2), lwd = 2,
+       legend = c(paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 2], 0)), "95%"), cex=1.5, bty = "n")
+plot(0,
+     ylab=expression(hat(beta)[2]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(0, 1),
+     main="Coverage Rate of the 95% CI",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(coverage[i, , 2] ~ dVec, lwd = 2, col = bias_colors[i])
+}
+abline(h = 0.95, lty = 2, lwd = 3)
+legend("bottomleft", col = c(bias_colors, "black"), lty=c(rep(1, length(bias_colors)), 2), lwd = 2,
+       legend = c(paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 3], 0)), "95%"), cex=1.5, bty = "n")
+plot(0,
+     ylab=expression(hat(beta)[1]*"(d)+"*hat(beta)[2]*"(d)+"*hat(beta)[3]*"(d)"),
+     xlab="Degree Distance (d)",
+     type="n",
+     xlim=c(0, 7),
+     ylim=c(0, 1),
+     main="Coverage Rate of the 95% CI",
+     lty = 2, col = "black",
+     cex.lab=2,
+     cex.main=1.5,
+		 cex.axis=1.5)
+for (i in 2:nrow(Allbias)){
+  lines(coverage[i, , 3] ~ dVec, lwd = 2, col = bias_colors[i])
+}
+abline(h = 0.95, lty = 2, lwd = 3)
+legend("bottomleft", col = c(bias_colors, "black"), lty=c(rep(1, length(bias_colors)), 2), lwd = 2,
+       legend = c(paste0("N=", round(cohortSize[-1, 1] + cohortSize[-1, 4], 0)), "95%"), cex=1.5, bty = "n")
+dev.off()
+```
+
